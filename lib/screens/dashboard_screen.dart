@@ -931,12 +931,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     final chartData = rows.reversed.toList();
 
-    final isSensorError = latest.isSensorError;
+    final isSensorError =
+        latest.isSensorError;
 
     final firmwareDisplay =
         _firmwareVersion.isNotEmpty
             ? _firmwareVersion
             : 'v--';
+
+    // Get PV voltage - use the actual field name from BatteryData
+    final pvVoltage = latest.tegPv ?? 0.0;
 
     return RefreshIndicator(
       onRefresh: () async {
@@ -1055,21 +1059,20 @@ class _DashboardScreenState extends State<DashboardScreen> {
           // ======================================================
 
           PowerFlowCard(
-            pvVoltage: latest.tegPv,
-            pvCurrent: _stickyArusIn,
-            batVoltage: latest.tegBat,
-            batCurrent: _stickyArusOut,
-            pln1Aktif: _rly1OptimisticOn ?? latest.plnAktif,
-            pln2Aktif: _rly2OptimisticOn ?? latest.pln2Aktif,
+            latest: latest,
+            stickyArusIn: _stickyArusIn,
+            stickyArusOut: _stickyArusOut,
+            rly1OptimisticOn: _rly1OptimisticOn,
+            rly2OptimisticOn: _rly2OptimisticOn,
             onTogglePln1: () => _toggleRelay(
               1,
               !(_rly1OptimisticOn ?? latest.plnAktif),
-              pvVoltage: latest.tegPv,
+              pvVoltage: pvVoltage,
             ),
             onTogglePln2: () => _toggleRelay(
               2,
               !(_rly2OptimisticOn ?? latest.pln2Aktif),
-              pvVoltage: latest.tegPv,
+              pvVoltage: pvVoltage,
             ),
           ),
 
@@ -1111,7 +1114,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                 onPressed: () => _toggleRelay(
                                   1,
                                   true,
-                                  pvVoltage: latest.tegPv,
+                                  pvVoltage: pvVoltage,
                                 ),
                                 child: const Text('ON'),
                               ),
@@ -1122,7 +1125,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                 onPressed: () => _toggleRelay(
                                   1,
                                   false,
-                                  pvVoltage: latest.tegPv,
+                                  pvVoltage: pvVoltage,
                                 ),
                                 child: const Text('OFF'),
                               ),
@@ -1171,7 +1174,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                 onPressed: () => _toggleRelay(
                                   2,
                                   true,
-                                  pvVoltage: latest.tegPv,
+                                  pvVoltage: pvVoltage,
                                 ),
                                 child: const Text('ON'),
                               ),
@@ -1182,7 +1185,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                 onPressed: () => _toggleRelay(
                                   2,
                                   false,
-                                  pvVoltage: latest.tegPv,
+                                  pvVoltage: pvVoltage,
                                 ),
                                 child: const Text('OFF'),
                               ),
@@ -1216,24 +1219,24 @@ class _DashboardScreenState extends State<DashboardScreen> {
             mainAxisSpacing: 12,
             children: [
               StatCard(
-                title: 'Tegangan PV',
+                label: 'Tegangan PV',
                 value:
-                    '${latest.tegPv.toStringAsFixed(1)} V',
+                    '${(latest.tegPv ?? 0.0).toStringAsFixed(1)} V',
                 color: Colors.blue,
               ),
               StatCard(
-                title: 'Tegangan Batt',
+                label: 'Tegangan Batt',
                 value:
-                    '${latest.tegBat.toStringAsFixed(1)} V',
+                    '${(latest.tegBat ?? 0.0).toStringAsFixed(1)} V',
                 color: Colors.green,
               ),
               StatCard(
-                title: 'Arus Input',
+                label: 'Arus Input',
                 value: '${_stickyArusIn.toStringAsFixed(1)} A',
                 color: Colors.orange,
               ),
               StatCard(
-                title: 'Arus Load',
+                label: 'Arus Load',
                 value:
                     '${_stickyArusOut.toStringAsFixed(1)} A',
                 color: Colors.red,
@@ -1279,15 +1282,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             sideTitles: SideTitles(
                               showTitles: true,
                               getTitlesWidget: (value, meta) {
-                                final idx =
-                                    value.toInt();
-                                if (idx < 0 ||
-                                    idx >=
-                                        chartData
-                                            .length) {
-                                  return const Text('');
-                                }
-                                return Text('');
+                                return const Text('');
                               },
                             ),
                           ),
@@ -1302,7 +1297,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                 .map((e) {
                               return FlSpot(
                                 e.key.toDouble(),
-                                e.value.tegBat,
+                                e.value.tegBat ?? 0.0,
                               );
                             }).toList(),
                             isCurved: true,
