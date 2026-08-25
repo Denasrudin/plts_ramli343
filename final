@@ -1,0 +1,2111 @@
+/*
+PLTS RAMLI 343 - v91.10 OTA-STABLE
+- OTA aman + heap check
+- BLE aktif sejak awal
+- WebServer ditunda
+- Nama file OTA rahasia (tidak ditampilkan)
+- Tidak ada kata ESP32 di komentar/print
+- Tombol pilih file berbahasa Indonesia
+*/
+
+#ifndef ARDUINO_USB_MODE
+#define ARDUINO_USB_MODE 1
+#endif
+#ifndef ARDUINO_USB_CDC_ON_BOOT
+#define ARDUINO_USB_CDC_ON_BOOT 1
+#endif
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <Update.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+#include <Preferences.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <LiquidCrystal_PCF8574.h>
+#include <time.h>
+#include <nvs_flash.h>
+#include <esp_task_wdt.h>
+#include <esp_coexist.h>
+#include <esp_wifi.h>
+#include <math.h>
+
+// ============================================================
+// VERSION & FEATURES
+// ============================================================
+#define CURRENT_FIRMWARE_VERSION "v91.10-OTA-STABLE"
+#define ENABLE_BLE 1
+#define ENABLE_SUPABASE 1
+#define ENABLE_WEB_OTA 1
+
+// ============================================================
+// SAFE SEMAPHORE MACROS
+// ============================================================
+#define TAKE_I2C(ticks) (i2cMutex != NULL && xSemaphoreTake(i2cMutex, ticks) == pdTRUE)
+#define GIVE_I2C() do { if (i2cMutex != NULL) xSemaphoreGive(i2cMutex); } while(0)
+#define TAKE_HTTP(ticks) (httpMutex != NULL && xSemaphoreTake(httpMutex, ticks) == pdTRUE)
+#define GIVE_HTTP() do { if (httpMutex != NULL) xSemaphoreGive(httpMutex); } while(0)
+
+// ============================================================
+// SUPABASE CONFIG
+// ============================================================
+#define SUPABASE_URL  "https://msmvwgtqvgeofhcnuyin.supabase.co"
+#define SUPABASE_KEY  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1zbXZ3Z3Rxdmdlb2ZoY251eWluIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI4Njc5MDAsImV4cCI6MjA5ODQ0MzkwMH0.Dw8tOuQPzV1Bh1Wz767LXG4vDSD3HGRwAhxZwHzF4Xc"
+#define SUPABASE_HOST "msmvwgtqvgeofhcnuyin.supabase.co"
+#define SUPABASE_TABLE "plts_logs"
+#define CONFIG_TABLE   "plts_config"
+
+// ============================================================
+// PIN
+// ============================================================
+#define RELAY1_PIN 10
+#define RELAY2_PIN 11
+#define I2C_SDA    4
+#define I2C_SCL    5
+
+// ============================================================
+// ADS1115 & DIVIDER
+// ============================================================
+#define ADS1115_ADDR       0x48
+#define ADS_CH_BATT_VOLT   0
+#define ADS_CH_PV_VOLT     1
+#define ADS_CH_SHUNT_INPUT 2
+#define ADS_CH_SHUNT_LOAD  3
+#define SHUNT_SWITCH_INTERVAL_MS 1000UL
+
+#define BATT_DIVIDER_RATIO 67.0f
+#define PV_DIVIDER_RATIO   265.0f
+#define SHUNT_MV_PER_A     0.75f
+#define ARUS_IDLE_THRESHOLD 0.5f
+
+float calibrationFactorBatt = 1.000f;
+float calibrationFactorPV   = 1.0f;
+float arusOffset            = 0.0f;
+float calibrationFactorArus = 1.0f;
+
+// ============================================================
+// FILTER & TIMING
+// ============================================================
+#define FILTER_SAMPLES       7
+#define EMA_ALPHA_TEGANGAN   0.25f
+#define EMA_ALPHA_ARUS       0.30f
+#define EMA_ALPHA_SHUNT      0.30f
+
+#define HTTP_CONNECT_TIMEOUT_MS  8000
+#define HTTP_TIMEOUT_MS          8000
+#define HTTP_MAX_RETRY           2
+#define WIFI_CONNECT_TIMEOUT_MS  20000
+#define WIFI_RECONNECT_INTERVAL  10000
+#define SERVER_POLL_INTERVAL_MS  5000
+#define INTERVAL_KIRIM_MS        15000UL
+
+// ============================================================
+// RELAY THRESHOLD
+// ============================================================
+float LF_BATT_ON_V   = 48.2f;
+float LF_BATT_OFF_V  = 52.0f;
+float PV_OVERRIDE_V  = 70.0f;
+float HF_ON_AMP      = 6.0f;
+float HF_OFF_AMP     = 15.0f;
+unsigned long HF_STABLE_TIME_MS = 3000;
+const unsigned long PV_STABLE_TIME_MS = 5UL * 60UL * 1000UL;
+
+// ============================================================
+// BLE UUIDs
+// ============================================================
+#define SERVICE_UUID     "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHAR_WRITE_UUID  "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+#define CHAR_STATUS_UUID "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
+// ============================================================
+// GLOBAL OBJECTS
+// ============================================================
+Adafruit_ADS1115 ads;
+LiquidCrystal_PCF8574 lcd(0x27);
+Preferences preferences;
+WebServer server(80);
+
+BLEServer *pServer = nullptr;
+BLECharacteristic *pCharWrite = nullptr;
+BLECharacteristic *pCharStatus = nullptr;
+SemaphoreHandle_t i2cMutex  = NULL;
+SemaphoreHandle_t httpMutex = NULL;
+WiFiClientSecure globalSecureClient;
+
+// ============================================================
+// SYSTEM STATE
+// ============================================================
+bool bleConnected = false;
+bool adsOK = false;
+bool batteryConnected = false;
+bool timeSynced = false;
+bool serverOnline = false;
+bool webServerStarted = false;
+volatile bool httpBusy = false;
+bool bleInitialized = false;
+bool mutexesReady = false;
+
+bool wifiReconnectPending = false;
+unsigned long wifiConnectStart = 0;
+unsigned long lastReconnect = 0;
+bool ntpConfigured = false;
+String pendingSsid = "";
+String pendingPass = "";
+
+float teganganSamples[FILTER_SAMPLES] = {0};
+int teganganIndex = 0;
+float teganganFiltered = 0.0f;
+bool teganganFilterInitialized = false;
+
+float arusInputSamples[FILTER_SAMPLES] = {0};
+float arusLoadSamples[FILTER_SAMPLES] = {0};
+int arusInputIndex = 0;
+int arusLoadIndex = 0;
+float arusInputFiltered = 0.0f;
+float arusLoadFiltered = 0.0f;
+float shuntInputSamples[FILTER_SAMPLES] = {0};
+float shuntLoadSamples[FILTER_SAMPLES] = {0};
+int shuntInputIndex = 0;
+int shuntLoadIndex = 0;
+float shuntInput_mVFiltered = 0.0f;
+float shuntLoad_mVFiltered = 0.0f;
+bool arusInputFilterInitialized = false;
+bool arusLoadFilterInitialized = false;
+bool shuntInputFilterInitialized = false;
+bool shuntLoadFilterInitialized = false;
+
+enum ShuntChannel { SHUNT_INPUT = 0, SHUNT_LOAD = 1 };
+ShuntChannel activeShuntChannel = SHUNT_INPUT;
+unsigned long lastShuntSwitch = 0;
+float arusInputOffset = 0.0f;
+float arusLoadOffset = 0.0f;
+float teganganPV = 0.0f;
+
+bool relay1Auto = true;
+bool relay2Auto = true;
+bool pln1Aktif = false;
+bool pln2Aktif = false;
+unsigned long lastRelay1Switch = 0;
+unsigned long lastRelay2Switch = 0;
+
+const unsigned long LCD_INTERVAL_UPDATE = 1000;
+const unsigned long SCROLL_INTERVAL_MS = 250;
+const unsigned long PAGE_DURATION_OTHER = 10000;
+const int TOTAL_PAGES = 4;
+int currentLcdPage = 0;
+int lastLcdPage = -1;
+unsigned long lcdPageStartTime = 0;
+unsigned long lastLcdUpdate = 0;
+unsigned long lastScrollTime = 0;
+int scrollOffset = 0;
+int scrollPassCount = 0;
+char dateTimeStr[80] = " ";
+const unsigned long RELAY_COOLDOWN_MS = 5000;
+const char* hariIndonesia[] = {"Minggu","Senin","Selasa","Rabu","Kamis","Jumat","Sabtu"};
+
+// ============================================================
+// PROTOTYPES
+// ============================================================
+float hitungMedian(float *arr, int n);
+float bacaTeganganBaterai();
+float bacaShuntChannel(ShuntChannel channel);
+float bacaTeganganPV();
+void sendDataToSupabase();
+void supabaseTaskFn(void *pvParameters);
+void pollRelayConfigFromServer();
+void syncTimeNTP();
+void updateLcdDisplay();
+void kontrolRelay();
+bool isWeatherTime();
+bool connectWiFi(String ssid, String pass);
+void startWiFiReconnect();
+void serviceWiFiReconnect();
+void serviceTimeSync();
+void formatTanggalIndonesia(char *buffer, size_t bufferSize, time_t t);
+void scanI2C();
+void setupWebServer();
+bool initializeMutexes();
+bool initializeBLE();
+
+// ============================================================
+// BLE CALLBACKS
+// ============================================================
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override { 
+    bleConnected = true; 
+    Serial.println("[BLE] Connected"); 
+  }
+  void onDisconnect(BLEServer* pServer) override { 
+    bleConnected = false; 
+    BLEDevice::startAdvertising(); 
+  }
+};
+
+class RelayCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pChar) override {
+    String cmd = pChar->getValue();
+    cmd.trim();
+    if (cmd.length() == 0) return;
+
+    if (cmd.startsWith("SSID=")) pendingSsid = cmd.substring(5);
+    else if (cmd.startsWith("PASS=")) pendingPass = cmd.substring(5);
+    else if (cmd == "SAVE") {
+      if (pendingSsid.length() > 0 && pendingPass.length() > 0) {
+        preferences.begin("plts", false);
+        preferences.putString("ssid", pendingSsid);
+        preferences.putString("pass", pendingPass);
+        preferences.end();
+        delay(800);
+        ESP.restart();
+      }
+    }
+    else if (cmd == "RESET") {
+      preferences.begin("plts", false);
+      preferences.remove("ssid");
+      preferences.remove("pass");
+      preferences.end();
+      delay(1000);
+      ESP.restart();
+    }
+    else if (cmd == "RLY1_ON") {
+      if (teganganPV >= PV_OVERRIDE_V) 
+        Serial.printf("[BLE] RLY1_ON DITOLAK PV=%.1fV\n", teganganPV);
+      else { 
+        relay1Auto = false; 
+        pln1Aktif = true; 
+        digitalWrite(RELAY1_PIN, LOW); 
+        lastRelay1Switch = millis(); 
+        Serial.println("[BLE] LF MANUAL ON"); 
+      }
+    }
+    else if (cmd == "RLY1_OFF") { 
+      relay1Auto = false; 
+      pln1Aktif = false; 
+      digitalWrite(RELAY1_PIN, HIGH); 
+      lastRelay1Switch = millis(); 
+      Serial.println("[BLE] LF MANUAL OFF"); 
+    }
+    else if (cmd == "RLY1_AUTO") { 
+      relay1Auto = true; 
+      Serial.println("[BLE] LF AUTO"); 
+    }
+    else if (cmd == "RLY2_ON") {
+      if (teganganPV >= PV_OVERRIDE_V) 
+        Serial.printf("[BLE] RLY2_ON DITOLAK PV=%.1fV\n", teganganPV);
+      else { 
+        relay2Auto = false; 
+        pln2Aktif = true; 
+        digitalWrite(RELAY2_PIN, LOW); 
+        lastRelay2Switch = millis(); 
+        Serial.println("[BLE] HF MANUAL ON"); 
+      }
+    }
+    else if (cmd == "RLY2_OFF") { 
+      relay2Auto = false; 
+      pln2Aktif = false; 
+      digitalWrite(RELAY2_PIN, HIGH); 
+      lastRelay2Switch = millis(); 
+      Serial.println("[BLE] HF MANUAL OFF"); 
+    }
+    else if (cmd == "RLY2_AUTO") { 
+      relay2Auto = true; 
+      Serial.println("[BLE] HF AUTO"); 
+    }
+  }
+};
+
+// ============================================================
+// HELPERS
+// ============================================================
+void formatTanggalIndonesia(char *buffer, size_t bufferSize, time_t t) {
+  struct tm* tmInfo = localtime(&t);
+  snprintf(buffer, bufferSize, "%s, %02d-%02d-%04d %02d:%02d:%02d ",
+           hariIndonesia[tmInfo->tm_wday], tmInfo->tm_mday, tmInfo->tm_mon + 1,
+           tmInfo->tm_year + 1900, tmInfo->tm_hour, tmInfo->tm_min, tmInfo->tm_sec);
+}
+
+bool isWeatherTime() {
+  if (!timeSynced) return false;
+  time_t now = time(nullptr);
+  struct tm* tmInfo = localtime(&now);
+  return (tmInfo->tm_hour >= 6 && tmInfo->tm_hour < 17);
+}
+
+float hitungMedian(float *arr, int n) {
+  float temp[FILTER_SAMPLES];
+  for (int i = 0; i < n; i++) temp[i] = arr[i];
+  for (int i = 0; i < n - 1; i++)
+    for (int j = 0; j < n - i - 1; j++)
+      if (temp[j] > temp[j + 1]) {
+        float t = temp[j]; temp[j] = temp[j+1]; temp[j+1] = t;
+      }
+  return temp[n / 2];
+}
+
+void scanI2C() {
+  Serial.println("[I2C] Scanning...");
+  int nDevices = 0;
+  for (byte addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("[I2C] Device found at 0x%02X\n", addr);
+      nDevices++;
+    }
+  }
+  if (nDevices == 0) Serial.println("[I2C] No devices found!");
+}
+
+// ============================================================
+// MUTEX
+// ============================================================
+bool initializeMutexes() {
+  if (mutexesReady) return true;
+  
+  Serial.println("[MUTEX] Initializing mutexes...");
+  
+  if (i2cMutex != NULL) {
+    vSemaphoreDelete(i2cMutex);
+    i2cMutex = NULL;
+  }
+  if (httpMutex != NULL) {
+    vSemaphoreDelete(httpMutex);
+    httpMutex = NULL;
+  }
+  
+  esp_task_wdt_reset();
+  
+  i2cMutex = xSemaphoreCreateMutex();
+  if (i2cMutex == NULL) {
+    Serial.println("[FATAL] Failed to create i2cMutex!");
+    return false;
+  }
+  
+  esp_task_wdt_reset();
+  
+  httpMutex = xSemaphoreCreateMutex();
+  if (httpMutex == NULL) {
+    Serial.println("[FATAL] Failed to create httpMutex!");
+    vSemaphoreDelete(i2cMutex);
+    i2cMutex = NULL;
+    return false;
+  }
+  
+  mutexesReady = true;
+  Serial.println("[MUTEX] ✓ Mutexes initialized successfully");
+  return true;
+}
+
+// ============================================================
+// BLE
+// ============================================================
+bool initializeBLE() {
+  if (bleInitialized) return true;
+  
+#if !ENABLE_BLE
+  Serial.println("[BLE] Disabled by config");
+  bleInitialized = false;
+  return true;
+#endif
+
+  Serial.printf("[HEAP] Before BLE init: %u bytes (Max Alloc: %u bytes)\n", 
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  
+  if (ESP.getMaxAllocHeap() < 100000) {
+    Serial.printf("[BLE] ERROR: Heap too fragmented! Need 100KB, have %u bytes\n", 
+                  ESP.getMaxAllocHeap());
+    return false;
+  }
+  
+  Serial.println("[BLE] Stabilizing heap (1000ms)...");
+  delay(1000);
+  esp_task_wdt_reset();
+  
+  if (ESP.getMaxAllocHeap() < 100000) {
+    Serial.printf("[BLE] ERROR: Heap still fragmented after wait! Have %u bytes\n", 
+                  ESP.getMaxAllocHeap());
+    return false;
+  }
+  
+  esp_task_wdt_reset();
+  
+  Serial.println("[BLE] Initializing device...");
+  try {
+    BLEDevice::init("PLTS_RAMLI343");
+    esp_task_wdt_reset();
+    
+    pServer = BLEDevice::createServer();
+    if (pServer == NULL) {
+      Serial.println("[BLE] ERROR: Failed to create server");
+      return false;
+    }
+    pServer->setCallbacks(new MyServerCallbacks());
+    esp_task_wdt_reset();
+    
+    BLEService *pService = pServer->createService(SERVICE_UUID);
+    if (pService == NULL) {
+      Serial.println("[BLE] ERROR: Failed to create service");
+      return false;
+    }
+    esp_task_wdt_reset();
+    
+    pCharWrite = pService->createCharacteristic(
+      CHAR_WRITE_UUID, 
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
+    );
+    if (pCharWrite == NULL) {
+      Serial.println("[BLE] ERROR: Failed to create write characteristic");
+      return false;
+    }
+    pCharWrite->setCallbacks(new RelayCallbacks());
+    esp_task_wdt_reset();
+    
+    pCharStatus = pService->createCharacteristic(
+      CHAR_STATUS_UUID, 
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+    );
+    if (pCharStatus == NULL) {
+      Serial.println("[BLE] ERROR: Failed to create status characteristic");
+      return false;
+    }
+    pCharStatus->addDescriptor(new BLE2902());
+    esp_task_wdt_reset();
+    
+    pService->start();
+    BLEDevice::getAdvertising()->addServiceUUID(SERVICE_UUID);
+    BLEDevice::startAdvertising();
+    esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+    
+    bleInitialized = true;
+    Serial.println("[BLE] ✓ Initialization complete");
+    return true;
+    
+  } catch (...) {
+    Serial.println("[BLE] EXCEPTION during initialization!");
+    bleInitialized = false;
+    return false;
+  }
+}
+
+// ============================================================
+// WIFI & NTP
+// ============================================================
+void WiFiEvent(WiFiEvent_t event) {
+  if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    Serial.printf("[WiFi] GOT IP: %s | RSSI: %d dBm\n", 
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    serverOnline = false;
+  } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    Serial.printf("[WiFi] Disconnected | status=%d\n", (int)WiFi.status());
+    serverOnline = false;
+    timeSynced = false;
+  }
+}
+
+bool connectWiFi(String ssid, String pass) {
+  if (ssid.length() == 0) return false;
+  if (WiFi.status() == WL_CONNECTED) return true;
+  
+  Serial.printf("[WiFi] Connecting to '%s'...\n", ssid.c_str());
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname("PLTS_RAMLI343");
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(false);
+  WiFi.setSleep(false);
+  esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+  esp_wifi_set_max_tx_power(52);
+  WiFi.disconnect(false);
+  delay(100);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  
+  unsigned long t0 = millis();
+  unsigned long lastPrint = 0;
+  while (millis() - t0 < WIFI_CONNECT_TIMEOUT_MS) {
+    esp_task_wdt_reset();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("[WiFi] CONNECTED | IP=%s | RSSI=%d dBm\n", 
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      return true;
+    }
+    if (millis() - lastPrint >= 2000) {
+      Serial.printf("[WiFi] Waiting... status=%d\n", (int)WiFi.status());
+      lastPrint = millis();
+    }
+    delay(100);
+  }
+  Serial.println("[WiFi] Connect timeout");
+  WiFi.disconnect(false);
+  return false;
+}
+
+void syncTimeNTP() {
+  if (WiFi.status() != WL_CONNECTED) { 
+    timeSynced = false; 
+    return; 
+  }
+  if (!ntpConfigured) {
+    Serial.println("[NTP] Configuring...");
+    configTime(7 * 3600, 0, "time.google.com", "pool.ntp.org", "id.pool.ntp.org");
+    ntpConfigured = true;
+  }
+  unsigned long t0 = millis();
+  while (millis() - t0 < 5000) {
+    esp_task_wdt_reset();
+    time_t now = time(nullptr);
+    if (now > 24 * 3600) {
+      timeSynced = true;
+      Serial.println("[NTP] ✓ Synced");
+      return;
+    }
+    delay(200);
+  }
+  timeSynced = false;
+  Serial.println("[NTP] Not synced yet");
+}
+
+void startWiFiReconnect() {
+  if (WiFi.status() == WL_CONNECTED || wifiReconnectPending) return;
+  
+  preferences.begin("plts", false);
+  String ssid = preferences.getString("ssid", "");
+  String pass = preferences.getString("pass", "");
+  preferences.end();
+  if (ssid.length() == 0) return;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname("PLTS_RAMLI343");
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(false);
+  WiFi.setSleep(false);
+  esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+  esp_wifi_set_max_tx_power(52);
+  WiFi.disconnect(false);
+  delay(50);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  wifiConnectStart = millis();
+  wifiReconnectPending = true;
+  Serial.printf("[WiFi] Async reconnect: %s\n", ssid.c_str());
+}
+
+void serviceWiFiReconnect() {
+  if (!wifiReconnectPending) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiReconnectPending = false;
+    ntpConfigured = false;
+    timeSynced = false;
+    serverOnline = false;
+    Serial.printf("[WiFi] RECONNECTED | IP=%s | RSSI=%d dBm\n", 
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    syncTimeNTP();
+    return;
+  }
+  if (millis() - wifiConnectStart >= WIFI_CONNECT_TIMEOUT_MS) {
+    Serial.println("[WiFi] Async reconnect timeout");
+    WiFi.disconnect(false);
+    wifiReconnectPending = false;
+    timeSynced = false;
+    serverOnline = false;
+  }
+}
+
+void serviceTimeSync() {
+  if (WiFi.status() != WL_CONNECTED) { 
+    timeSynced = false; 
+    return; 
+  }
+  if (!ntpConfigured) { 
+    syncTimeNTP(); 
+    return; 
+  }
+  time_t now = time(nullptr);
+  timeSynced = (now > 24 * 3600);
+}
+
+// ============================================================
+// WEB SERVER OTA
+// ============================================================
+void setupWebServer() {
+
+  if (webServerStarted) {
+    Serial.println("[WEB] WebServer sudah aktif.");
+    return;
+  }
+
+  Serial.println("[WEB] Starting WebServer...");
+
+  if (ESP.getMaxAllocHeap() < 30000) {
+    Serial.printf("[WEB] Heap insufficient: %u bytes\n", ESP.getMaxAllocHeap());
+    return;
+  }
+
+  static bool otaFileNameValid = false;
+  static bool otaStarted = false;
+  static bool otaWriteError = false;
+  static size_t otaReceived = 0;
+  static unsigned long otaLastProgress = 0;
+
+  // ==========================================================
+  // HALAMAN UTAMA OTA
+  // ==========================================================
+  server.on("/", HTTP_GET, []() {
+
+    const char* html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PLTS RAMLI343 OTA</title>
+<style>
+body{font-family:Arial,sans-serif;text-align:center;padding:25px 15px;background:#1a1a1a;color:#fff;}
+.box{max-width:500px;margin:auto;background:#222;padding:20px;border-radius:12px;border:1px solid #333;}
+button{margin-top:15px;padding:12px 25px;font-size:16px;background:#00ff00;color:#000;border:none;border-radius:5px;cursor:pointer;font-weight:bold;}
+button:disabled{cursor:not-allowed;opacity:.5;}
+#pilihFileBtn{width:90%;padding:12px;background:#333;color:#00ff00;border:1px solid #00ff00;border-radius:5px;font-size:15px;cursor:pointer;}
+#namaFile{margin-top:10px;color:#aaa;font-size:13px;}
+#progressBox{display:none;margin-top:25px;}
+.progressOuter{width:100%;height:28px;background:#333;border-radius:14px;overflow:hidden;border:1px solid #555;}
+#progressBar{width:0%;height:100%;background:#00ff00;color:#000;font-weight:bold;line-height:28px;text-align:center;transition:width .15s;}
+#percent{font-size:28px;font-weight:bold;margin-top:15px;}
+#status{margin-top:12px;color:#aaa;font-size:14px;line-height:1.5;}
+#sizeInfo{margin-top:8px;color:#aaa;font-size:13px;}
+#restartBox{display:none;margin-top:20px;padding:15px;border-radius:8px;background:#111;border:1px solid #555;color:#aaa;}
+#doneBox{display:none;margin-top:20px;padding:15px;border-radius:8px;background:#102010;border:1px solid #00ff00;color:#00ff00;font-weight:bold;}
+#errorBox{display:none;margin-top:20px;padding:15px;border-radius:8px;background:#201010;border:1px solid #ff4444;color:#ff6666;font-weight:bold;}
+#onlineBox{display:none;margin-top:15px;color:#00ff00;font-weight:bold;}
+</style>
+</head>
+<body>
+<div class="box">
+<h2>UPDATE PLTS RAMLI343</h2>
+<h3>Web OTA</h3>
+<p>Firmware Saat Ini:<br><b id="firmwareVersion">)rawliteral" CURRENT_FIRMWARE_VERSION R"rawliteral(</b></p>
+
+<form id="otaForm">
+  <!-- Input file disembunyikan -->
+  <input type="file" id="fileInput" name="update" accept=".bin" required style="display:none;">
+
+  <!-- Tombol custom berbahasa Indonesia -->
+  <button type="button" id="pilihFileBtn">Masukkan File</button>
+  <div id="namaFile">Belum ada file dipilih</div>
+
+  <br>
+  <button type="submit" id="uploadButton">UPLOAD FIRMWARE</button>
+</form>
+
+<div id="progressBox">
+  <div id="percent">0%</div>
+  <div class="progressOuter"><div id="progressBar">0%</div></div>
+  <div id="sizeInfo">0 KB / 0 KB</div>
+  <div id="status">Menunggu upload...</div>
+</div>
+
+<div id="restartBox">
+  <b>Box Sensor sedang restart...</b><br><br>
+  <span id="restartText">Menunggu Box Sensor kembali online...</span>
+</div>
+
+<div id="doneBox">
+  OTA SELESAI<br><br>
+  Box Sensor sudah online kembali.<br>
+  Firmware baru berhasil dijalankan.
+</div>
+
+<div id="errorBox">
+  OTA GAGAL<br><br>
+  <span id="errorText">Periksa Serial Monitor.</span>
+</div>
+
+<div id="onlineBox">Box Sensor ONLINE</div>
+
+<p style="margin-top:35px;font-size:12px;color:#fff;">
+Jangan matikan daya selama proses upload!<br><br>
+denasrudin@gmail.com
+</p>
+</div>
+
+<script>
+var checkTimer=null,checkCount=0,maxChecks=40;
+var fileInput=document.getElementById("fileInput");
+var uploadButton=document.getElementById("uploadButton");
+var progressBox=document.getElementById("progressBox");
+var progressBar=document.getElementById("progressBar");
+var percent=document.getElementById("percent");
+var sizeInfo=document.getElementById("sizeInfo");
+var statusBox=document.getElementById("status");
+var restartBox=document.getElementById("restartBox");
+var restartText=document.getElementById("restartText");
+var doneBox=document.getElementById("doneBox");
+var errorBox=document.getElementById("errorBox");
+var errorText=document.getElementById("errorText");
+var namaFileDiv=document.getElementById("namaFile");
+
+function resetDisplay(){
+  progressBox.style.display="none";
+  restartBox.style.display="none";
+  doneBox.style.display="none";
+  errorBox.style.display="none";
+  progressBar.style.width="0%";
+  progressBar.innerHTML="0%";
+  percent.innerHTML="0%";
+  sizeInfo.innerHTML="0 KB / 0 KB";
+  statusBox.innerHTML="Menunggu upload...";
+}
+
+function checkDevice(){
+  checkCount++;
+  restartText.innerHTML="Mencoba menghubungkan kembali... ("+checkCount+"/"+maxChecks+")";
+  var xhr=new XMLHttpRequest();
+  xhr.open("GET","/ota-status?t="+Date.now(),true);
+  xhr.timeout=2000;
+  xhr.onreadystatechange=function(){
+    if(xhr.readyState!==4)return;
+    if(xhr.status===200){
+      if(checkTimer){clearInterval(checkTimer);checkTimer=null;}
+      restartText.innerHTML="Box Sensor sudah merespons kembali.";
+      statusBox.innerHTML="Firmware baru sudah berjalan.";
+      doneBox.style.display="block";
+      errorBox.style.display="none";
+      uploadButton.disabled=false;
+      uploadButton.style.opacity="1";
+    }
+  };
+  xhr.onerror=function(){};
+  xhr.ontimeout=function(){};
+  xhr.send();
+  if(checkCount>=maxChecks){
+    if(checkTimer){clearInterval(checkTimer);checkTimer=null;}
+    restartText.innerHTML="Box Sensor belum merespons.";
+    errorBox.style.display="block";
+    errorText.innerHTML="Box Sensor belum merespons setelah "+maxChecks+" detik. Periksa Serial Monitor.";
+    uploadButton.disabled=false;
+    uploadButton.style.opacity="1";
+  }
+}
+
+// Tombol "Masukkan File"
+document.getElementById("pilihFileBtn").addEventListener("click",function(){
+  fileInput.click();
+});
+
+// Tampilkan nama file yang dipilih
+fileInput.addEventListener("change",function(){
+  var file=this.files[0];
+  if(file){
+    namaFileDiv.innerHTML="File: <b style='color:#00ff00;'>"+file.name+"</b>";
+  }else{
+    namaFileDiv.innerHTML="Belum ada file dipilih";
+  }
+});
+
+document.getElementById("otaForm").addEventListener("submit",function(e){
+  e.preventDefault();
+  var file=fileInput.files[0];
+  if(!file){
+    alert("Maaf, file salah!");
+    return;
+  }
+  // Nama file rahasia
+  if(file.name!=="update_plts.bin"){
+    alert("Maaf, file salah!");
+    fileInput.value="";
+    namaFileDiv.innerHTML="Belum ada file dipilih";
+    return;
+  }
+  if(checkTimer){clearInterval(checkTimer);checkTimer=null;}
+  checkCount=0;
+  progressBox.style.display="block";
+  restartBox.style.display="none";
+  doneBox.style.display="none";
+  errorBox.style.display="none";
+  uploadButton.disabled=true;
+  uploadButton.style.opacity="0.5";
+  progressBar.style.width="0%";
+  progressBar.innerHTML="0%";
+  percent.innerHTML="0%";
+  sizeInfo.innerHTML="0 KB / "+(file.size/1024).toFixed(1)+" KB";
+  statusBox.innerHTML="Mengupload ...";
+
+  var xhr=new XMLHttpRequest();
+  var formData=new FormData();
+  formData.append("update",file);
+
+  xhr.upload.addEventListener("progress",function(ev){
+    if(!ev.lengthComputable)return;
+    var p=Math.round((ev.loaded/ev.total)*100);
+    if(p<0)p=0;if(p>100)p=100;
+    progressBar.style.width=p+"%";
+    progressBar.innerHTML=p+"%";
+    percent.innerHTML=p+"%";
+    sizeInfo.innerHTML=(ev.loaded/1024).toFixed(1)+" KB / "+(ev.total/1024).toFixed(1)+" KB";
+    statusBox.innerHTML=(p<100)?"Mengupload firmware...":"Upload 100%. Memvalidasi firmware...";
+  },false);
+
+  xhr.onreadystatechange=function(){
+    if(xhr.readyState!==4)return;
+    if(xhr.status===200){
+      progressBar.style.width="100%";
+      progressBar.innerHTML="100%";
+      percent.innerHTML="100%";
+      statusBox.innerHTML="Firmware berhasil diterima Box Sensor.";
+      restartBox.style.display="block";
+      restartText.innerHTML="Firmware valid. Box Sensor akan restart...";
+      setTimeout(function(){
+        restartText.innerHTML="Menunggu Box Sensor kembali online...";
+        checkCount=0;
+        if(checkTimer)clearInterval(checkTimer);
+        checkTimer=setInterval(checkDevice,1000);
+        checkDevice();
+      },3000);
+      return;
+    }
+    statusBox.innerHTML="OTA GAGAL.";
+    errorBox.style.display="block";
+    errorText.innerHTML="HTTP Error: "+xhr.status;
+    uploadButton.disabled=false;
+    uploadButton.style.opacity="1";
+  };
+
+  xhr.onerror=function(){
+    statusBox.innerHTML="Koneksi terputus. Memeriksa Box Sensor...";
+    restartBox.style.display="block";
+    restartText.innerHTML="Memeriksa apakah Box Sensor sedang restart...";
+    checkCount=0;
+    if(checkTimer)clearInterval(checkTimer);
+    checkTimer=setInterval(checkDevice,1000);
+    setTimeout(checkDevice,2000);
+  };
+
+  xhr.ontimeout=function(){
+    statusBox.innerHTML="Upload timeout. Memeriksa Box Sensor...";
+    restartBox.style.display="block";
+    restartText.innerHTML="Memeriksa apakah Box Sensor sedang restart...";
+    checkCount=0;
+    if(checkTimer)clearInterval(checkTimer);
+    checkTimer=setInterval(checkDevice,1000);
+    checkDevice();
+  };
+
+  xhr.open("POST","/update",true);
+  xhr.timeout=300000;
+  xhr.send(formData);
+});
+
+resetDisplay();
+</script>
+</body>
+</html>
+)rawliteral";
+
+    server.send(200, "text/html", html);
+  });
+
+  // ==========================================================
+  // OTA STATUS
+  // ==========================================================
+  server.on("/ota-status", HTTP_GET, []() {
+    String json;
+    json.reserve(256);
+    json = "{\"status\":\"online\",\"firmware\":\"";
+    json += CURRENT_FIRMWARE_VERSION;
+    json += "\",\"heap\":";
+    json += String(ESP.getFreeHeap());
+    json += ",\"uptime\":";
+    json += String(millis());
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  // ==========================================================
+  // OTA POST
+  // ==========================================================
+  server.on("/update", HTTP_POST,
+    []() {
+      if(!otaFileNameValid){
+        Serial.println("[OTA] MAAF, FILE SALAH!");
+        server.send(400, "text/plain", "Maaf, file salah!");
+        return;
+      }
+      if(!otaStarted){
+        Serial.println("[OTA] OTA tidak dimulai.");
+        server.send(500, "text/plain", "OTA tidak dimulai.");
+        return;
+      }
+      if(otaWriteError || Update.hasError()){
+        Serial.println("[OTA] Upload GAGAL!");
+        server.send(500, "text/plain", "Upload GAGAL! Cek Serial Monitor.");
+        return;
+      }
+
+      Serial.println();
+      Serial.println("[OTA] ==================================");
+      Serial.println("[OTA] UPLOAD BERHASIL!");
+      Serial.println("[OTA] FIRMWARE VALID!");
+      Serial.printf("[OTA] Total diterima: %u bytes\n", otaReceived);
+      Serial.println("[OTA] HTTP response dikirim.");
+      Serial.println("[OTA] ==================================");
+
+      server.send(200, "text/plain", "Upload BERHASIL! Firmware valid. Box Sensor akan restart...");
+      delay(1200);
+      Serial.println("[OTA] RESTART Box Sensor...");
+      delay(200);
+      ESP.restart();
+    },
+    []() {
+      HTTPUpload& upload = server.upload();
+
+      if(upload.status == UPLOAD_FILE_START){
+        otaFileNameValid = false;
+        otaStarted = false;
+        otaWriteError = false;
+        otaReceived = 0;
+        otaLastProgress = millis();
+
+        Serial.println();
+        Serial.println("[OTA] ==================================");
+        Serial.printf("[OTA] Nama file diterima: %s\n", upload.filename.c_str());
+
+        if(upload.filename != "update_plts.bin"){
+          Serial.println("[OTA] MAAF, FILE SALAH!");
+          Serial.println("[OTA] Upload DITOLAK.");
+          Serial.println("[OTA] ==================================");
+          otaFileNameValid = false;
+          otaStarted = false;
+          return;
+        }
+
+        otaFileNameValid = true;
+        Serial.println("[OTA] Nama file benar.");
+        Serial.printf("[OTA] Free Heap      : %u bytes\n", ESP.getFreeHeap());
+        Serial.printf("[OTA] Max Alloc Heap : %u bytes\n", ESP.getMaxAllocHeap());
+
+        if(ESP.getMaxAllocHeap() < 30000){
+          Serial.printf("[OTA] Max continuous heap terlalu rendah: %u\n", ESP.getMaxAllocHeap());
+          otaStarted = false;
+          return;
+        }
+
+        if(!Update.begin(UPDATE_SIZE_UNKNOWN)){
+          Serial.print("[OTA] Error Update.begin: ");
+          Update.printError(Serial);
+          otaStarted = false;
+          return;
+        }
+        otaStarted = true;
+        Serial.println("[OTA] Update.begin OK");
+      }
+      else if(upload.status == UPLOAD_FILE_WRITE){
+        if(!otaFileNameValid || !otaStarted || otaWriteError) return;
+
+        if(ESP.getFreeHeap() < 5000){
+          Serial.printf("[OTA] WARNING Heap rendah: %u bytes\n", ESP.getFreeHeap());
+          delay(10);
+          yield();
+        }
+
+        size_t written = Update.write(upload.buf, upload.currentSize);
+        otaReceived += written;
+
+        if(written != upload.currentSize){
+          otaWriteError = true;
+          Serial.printf("[OTA] Update.write ERROR: wrote %u of %u bytes, error=%d\n",
+                        written, upload.currentSize, Update.getError());
+          Update.printError(Serial);
+          return;
+        }
+
+        if(millis() - otaLastProgress >= 500){
+          otaLastProgress = millis();
+          Serial.printf("[OTA] Received: %u bytes | Heap: %u\n", otaReceived, ESP.getFreeHeap());
+        }
+        yield();
+      }
+      else if(upload.status == UPLOAD_FILE_END){
+        if(!otaFileNameValid || !otaStarted){
+          Serial.println("[OTA] File tidak valid. OTA dibatalkan.");
+          return;
+        }
+        if(otaWriteError){
+          Serial.println("[OTA] Write error. OTA dibatalkan.");
+          Update.end();
+          otaStarted = false;
+          return;
+        }
+
+        Serial.println();
+        Serial.printf("[OTA] Upload selesai. Total: %u bytes\n", otaReceived);
+
+        if(Update.end(true)){
+          Serial.println("[OTA] ==================================");
+          Serial.println("[OTA] FIRMWARE VALID!");
+          Serial.printf("[OTA] Total ukuran: %u bytes\n", otaReceived);
+          Serial.println("[OTA] Menunggu HTTP response...");
+          Serial.println("[OTA] ==================================");
+        }else{
+          otaWriteError = true;
+          Serial.print("[OTA] Error Update.end: ");
+          Update.printError(Serial);
+        }
+      }
+      else if(upload.status == UPLOAD_FILE_ABORTED){
+        Serial.println("[OTA] Upload dibatalkan.");
+        if(otaStarted) Update.end();
+        otaStarted = false;
+        otaFileNameValid = false;
+        otaWriteError = true;
+      }
+    }
+  );
+
+  server.begin();
+  webServerStarted = true;
+
+  Serial.println("[WEB] ==================================");
+  Serial.println("[WEB] OTA Web Server DIMULAI");
+  Serial.printf("[WEB] IP: http://%s\n", WiFi.localIP().toString().c_str());
+  Serial.println("[WEB] ==================================");
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println();
+  Serial.println("========================================");
+  Serial.printf(" PLTS RAMLI 343 %s FINAL\n", CURRENT_FIRMWARE_VERSION);
+  Serial.println(" Dual Shunt A2/A3 + Logika Relay Final");
+  Serial.println(" BLE AKTIF SEJAK AWAL UNTUK KONFIGURASI");
+  Serial.println(" OTA: Web Server Mandiri (Browser)");
+  Serial.println("========================================");
+
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = 30000,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  esp_task_wdt_reconfigure(&wdt_config);
+  esp_task_wdt_add(NULL);
+
+  nvs_flash_init();
+  WiFi.onEvent(WiFiEvent);
+
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  digitalWrite(RELAY1_PIN, HIGH);
+  digitalWrite(RELAY2_PIN, HIGH);
+  delay(300);
+
+  if (!initializeMutexes()) {
+    Serial.println("[FATAL] Mutex initialization failed! Rebooting...");
+    delay(2000);
+    ESP.restart();
+  }
+  esp_task_wdt_reset();
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+  delay(300);
+  scanI2C();
+
+  if (TAKE_I2C((TickType_t)100)) {
+    lcd.begin(16, 2);
+    lcd.setBacklight(0);
+    lcd.clear();
+    lcd.print("INITIALIZING...");
+    GIVE_I2C();
+  }
+  delay(300);
+
+  adsOK = ads.begin(ADS1115_ADDR);
+  Serial.printf("[STARTUP] ADS1115: %s\n", adsOK ? "OK" : "FAIL");
+  delay(300);
+  esp_task_wdt_reset();
+
+  if (ENABLE_BLE) {
+    if (!initializeBLE()) {
+      Serial.println("[WARNING] BLE init failed, will retry later in loop");
+      bleInitialized = false;
+    }
+  }
+  esp_task_wdt_reset();
+
+  preferences.begin("plts", false);
+  String ssid = preferences.getString("ssid", "");
+  String pass = preferences.getString("pass", "");
+  preferences.end();
+
+  if (ssid.length() > 0) {
+    if (connectWiFi(ssid, pass)) {
+      delay(500);
+      syncTimeNTP();
+    } else {
+      startWiFiReconnect();
+    }
+  } else {
+    Serial.println("[WiFi] No saved SSID - waiting for BLE configuration");
+  }
+  esp_task_wdt_reset();
+
+  if (adsOK) {
+    Serial.println("[CAL] Calibrating A2/A3 offsets...");
+    ads.setGain(GAIN_SIXTEEN);
+    delay(300);
+    float inputOffsetSum = 0.0f;
+    float loadOffsetSum = 0.0f;
+    for (int i = 0; i < 20; i++) {
+      esp_task_wdt_reset();
+      if (!TAKE_I2C((TickType_t)50)) continue;
+      int16_t rawInput = ads.readADC_SingleEnded(ADS_CH_SHUNT_INPUT);
+      delayMicroseconds(800);
+      int16_t rawLoad = ads.readADC_SingleEnded(ADS_CH_SHUNT_LOAD);
+      GIVE_I2C();
+      float input_mV = rawInput * 0.0078125f;
+      float load_mV = rawLoad * 0.0078125f;
+      inputOffsetSum += (input_mV / SHUNT_MV_PER_A) * calibrationFactorArus;
+      loadOffsetSum += (load_mV / SHUNT_MV_PER_A) * calibrationFactorArus;
+      delay(30);
+    }
+    arusInputOffset = inputOffsetSum / 20.0f;
+    arusLoadOffset = loadOffsetSum / 20.0f;
+    if (fabs(arusInputOffset) > 2.0f) arusInputOffset = 0.0f;
+    if (fabs(arusLoadOffset) > 2.0f) arusLoadOffset = 0.0f;
+    Serial.printf("[CAL] A2 INPUT Offset: %.4fA\n", arusInputOffset);
+    Serial.printf("[CAL] A3 LOAD Offset: %.4fA\n", arusLoadOffset);
+    
+    for (int i = 0; i < FILTER_SAMPLES; i++) {
+      arusInputSamples[i] = 0.0f;
+      arusLoadSamples[i] = 0.0f;
+      shuntInputSamples[i] = 0.0f;
+      shuntLoadSamples[i] = 0.0f;
+    }
+  }
+  esp_task_wdt_reset();
+
+  if (TAKE_I2C((TickType_t)100)) {
+    lcd.setBacklight(200);
+    GIVE_I2C();
+  }
+
+  if (ENABLE_SUPABASE) {
+    xTaskCreate(supabaseTaskFn, "SupabaseTask", 16384, NULL, 1, NULL);
+  }
+
+  Serial.printf("[HEAP] Free: %u bytes | Max Alloc: %u bytes\n", 
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  Serial.println("=== INIT COMPLETE ===\n");
+
+  currentLcdPage = 0;
+  lastLcdPage = -1;
+  lcdPageStartTime = millis();
+  scrollOffset = 0;
+  scrollPassCount = 0;
+  lastScrollTime = millis();
+  updateLcdDisplay();
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+void loop() {
+  esp_task_wdt_reset();
+  unsigned long now = millis();
+
+  static unsigned long lastBleRetry = 0;
+  if (!bleInitialized && ENABLE_BLE && (now - lastBleRetry >= 30000)) {
+    lastBleRetry = now;
+    Serial.println("[BLE] Retrying BLE initialization...");
+    if (initializeBLE()) {
+      Serial.println("[BLE] BLE initialized successfully on retry");
+    } else {
+      Serial.println("[BLE] BLE retry failed, will try again later");
+    }
+  }
+
+  static bool webServerDeferredDone = false;
+  if (!webServerDeferredDone && WiFi.status() == WL_CONNECTED) {
+    if (ESP.getMaxAllocHeap() >= 30000) {
+      Serial.println("[INIT] Starting deferred WebServer...");
+      setupWebServer();
+      webServerDeferredDone = true;
+    } else {
+      static unsigned long lastHeapLog = 0;
+      if (now - lastHeapLog > 10000) {
+        Serial.printf("[INIT] Deferred WebServer: heap max alloc = %u, need 30000\n", ESP.getMaxAllocHeap());
+        lastHeapLog = now;
+      }
+    }
+  }
+
+  if (webServerStarted) {
+    server.handleClient();
+  }
+
+  static unsigned long lastHeartbeat = 0;
+  if (now - lastHeartbeat > 10000) {
+    Serial.printf("[HEARTBEAT] Heap:%u | BATT:%.2fV | PV:%.1fV | IN:%.2fA | LOAD:%.2fA | SHUNT:%s | LF:%s | HF:%s | WiFi:%s | Server:%s | RSSI:%d | BLE:%s\n",
+                  ESP.getFreeHeap(), teganganFiltered, teganganPV,
+                  arusInputFiltered, arusLoadFiltered,
+                  activeShuntChannel == SHUNT_INPUT ? "A2" : "A3",
+                  pln1Aktif ? "PLN" : "PLTS", pln2Aktif ? "PLN" : "PLTS",
+                  WiFi.status() == WL_CONNECTED ? "OK" : "OFF",
+                  serverOnline ? "ONLINE" : "OFFLINE",
+                  WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0,
+                  bleInitialized ? (bleConnected ? "CONN" : "ADV") : "OFF");
+    lastHeartbeat = now;
+  }
+
+  serviceWiFiReconnect();
+  serviceTimeSync();
+
+  if (WiFi.status() != WL_CONNECTED && !wifiReconnectPending && now - lastReconnect >= WIFI_RECONNECT_INTERVAL) {
+    lastReconnect = now;
+    startWiFiReconnect();
+  }
+
+  teganganPV = bacaTeganganPV();
+  bacaTeganganBaterai();
+
+  if (now - lastShuntSwitch >= SHUNT_SWITCH_INTERVAL_MS || lastShuntSwitch == 0) {
+    lastShuntSwitch = now;
+    if (activeShuntChannel == SHUNT_INPUT) {
+      bacaShuntChannel(SHUNT_INPUT);
+      activeShuntChannel = SHUNT_LOAD;
+    } else {
+      bacaShuntChannel(SHUNT_LOAD);
+      activeShuntChannel = SHUNT_INPUT;
+    }
+  }
+
+  kontrolRelay();
+
+  static unsigned long lastPollRelay = 0;
+  if (WiFi.status() == WL_CONNECTED && now - lastPollRelay >= SERVER_POLL_INTERVAL_MS) {
+    lastPollRelay = now;
+    pollRelayConfigFromServer();
+  }
+
+  if (timeSynced) {
+    char tanggal[40];
+    formatTanggalIndonesia(tanggal, sizeof(tanggal), time(nullptr));
+    String cuaca;
+    if (isWeatherTime()) {
+      if (teganganPV < 70.0f) cuaca = " CUACA:BLM MENDUKUNG";
+      else if (teganganPV < 110.0f) cuaca = " CUACA:PANAS";
+      else cuaca = " CUACA:PANAS BANGET";
+    } else {
+      cuaca = " CUACA:CHG PV BELUM SIAP";
+    }
+    snprintf(dateTimeStr, sizeof(dateTimeStr), "%s%s", tanggal, cuaca.c_str());
+  } else {
+    strcpy(dateTimeStr, "--:--:-- --/--/---- NTP BELUM SYNC");
+  }
+
+  bool bothAuto = relay1Auto && relay2Auto;
+  bool wifiOK = (WiFi.status() == WL_CONNECTED);
+  bool anyOffline = !wifiOK || !timeSynced;
+
+  if (!bothAuto && currentLcdPage != 2) {
+    currentLcdPage = 2; 
+    lcdPageStartTime = now; 
+    scrollOffset = 0; 
+    scrollPassCount = 0;
+  } else if (anyOffline && currentLcdPage != 3) {
+    currentLcdPage = 3; 
+    lcdPageStartTime = now; 
+    scrollOffset = 0; 
+    scrollPassCount = 0;
+  } else if (bothAuto && !anyOffline) {
+    if (currentLcdPage == 0) {
+      if (now - lastScrollTime >= SCROLL_INTERVAL_MS) {
+        lastScrollTime = now;
+        int len = strlen(dateTimeStr);
+        if (len > 0) {
+          scrollOffset++;
+          if (scrollOffset >= len) {
+            scrollPassCount++;
+            if (scrollPassCount >= 1) {
+              currentLcdPage = 1; 
+              lcdPageStartTime = now; 
+              scrollOffset = 0; 
+              scrollPassCount = 0;
+            }
+          }
+        }
+      }
+    } else {
+      if (now - lcdPageStartTime >= PAGE_DURATION_OTHER) {
+        currentLcdPage = (currentLcdPage + 1) % TOTAL_PAGES;
+        lcdPageStartTime = now; 
+        scrollOffset = 0; 
+        scrollPassCount = 0;
+      }
+    }
+  }
+
+  if (now - lastLcdUpdate >= LCD_INTERVAL_UPDATE) {
+    lastLcdUpdate = now;
+    updateLcdDisplay();
+  }
+
+  delay(10);
+}
+
+// ============================================================
+// RELAY CONTROL
+// ============================================================
+void kontrolRelay() {
+  unsigned long now = millis();
+  float arusLoadAbs = fabs(arusLoadFiltered);
+  static bool hfHighArusStable = false;
+  static unsigned long hfHighArusStartTime = 0;
+  static bool pvStableHigh = false;
+  static unsigned long pvStableStartTime = 0;
+  static bool pvOverrideActive = false;
+
+  if (teganganPV >= PV_OVERRIDE_V) {
+    if (!pvStableHigh) { 
+      pvStableHigh = true; 
+      pvStableStartTime = now; 
+    }
+    else if ((now - pvStableStartTime) >= PV_STABLE_TIME_MS) {
+      if (!pvOverrideActive) { 
+        pvOverrideActive = true; 
+        Serial.println("[PV] STABIL 5 MENIT → SEMUA RELAY OFF"); 
+      }
+    }
+  } else {
+    pvStableHigh = false; 
+    pvStableStartTime = 0; 
+    pvOverrideActive = false;
+  }
+
+  if (pvOverrideActive) {
+    if (relay1Auto && pln1Aktif && (now - lastRelay1Switch >= RELAY_COOLDOWN_MS)) {
+      digitalWrite(RELAY1_PIN, HIGH); 
+      pln1Aktif = false; 
+      lastRelay1Switch = now; 
+      Serial.println("[LF] OFF (PV Override)");
+    }
+    if (relay2Auto && pln2Aktif && (now - lastRelay2Switch >= RELAY_COOLDOWN_MS)) {
+      digitalWrite(RELAY2_PIN, HIGH); 
+      pln2Aktif = false; 
+      lastRelay2Switch = now; 
+      Serial.println("[HF] OFF (PV Override)");
+    }
+    return;
+  }
+
+  bool batteryLow = (batteryConnected && teganganFiltered <= LF_BATT_ON_V);
+  bool batteryHigh = (batteryConnected && teganganFiltered >= LF_BATT_OFF_V);
+
+  if (batteryLow) {
+    if (relay1Auto && !pln1Aktif && (now - lastRelay1Switch >= RELAY_COOLDOWN_MS)) {
+      digitalWrite(RELAY1_PIN, LOW); 
+      pln1Aktif = true; 
+      lastRelay1Switch = now;
+      Serial.printf("[LF] ON (BATT=%.2fV ≤ %.1f)\n", teganganFiltered, LF_BATT_ON_V);
+    }
+  } else if (batteryHigh) {
+    if (relay1Auto && pln1Aktif && (now - lastRelay1Switch >= RELAY_COOLDOWN_MS)) {
+      digitalWrite(RELAY1_PIN, HIGH); 
+      pln1Aktif = false; 
+      lastRelay1Switch = now;
+      Serial.printf("[LF] OFF (BATT=%.2fV ≥ %.1f)\n", teganganFiltered, LF_BATT_OFF_V);
+    }
+  }
+
+  bool lfIsOn = pln1Aktif;
+  if (lfIsOn) {
+    if (arusLoadAbs < HF_ON_AMP) {
+      if (relay2Auto && !pln2Aktif && (now - lastRelay2Switch >= RELAY_COOLDOWN_MS)) {
+        digitalWrite(RELAY2_PIN, LOW); 
+        pln2Aktif = true; 
+        lastRelay2Switch = now;
+        Serial.printf("[HF] ON (LF ON & ARUS=%.1fA < %.1fA)\n", arusLoadAbs, HF_ON_AMP);
+      }
+    }
+    if (arusLoadAbs >= HF_OFF_AMP) {
+      if (!hfHighArusStable) { 
+        hfHighArusStable = true; 
+        hfHighArusStartTime = now; 
+      }
+      if (hfHighArusStable && (now - hfHighArusStartTime >= HF_STABLE_TIME_MS)) {
+        if (relay2Auto && pln2Aktif && (now - lastRelay2Switch >= RELAY_COOLDOWN_MS)) {
+          digitalWrite(RELAY2_PIN, HIGH); 
+          pln2Aktif = false; 
+          lastRelay2Switch = now;
+          Serial.printf("[HF] OFF (ARUS=%.1fA ≥ %.1fA STABIL 3D)\n", arusLoadAbs, HF_OFF_AMP);
+        }
+        hfHighArusStable = false; 
+        hfHighArusStartTime = 0;
+      }
+    } else {
+      hfHighArusStable = false; 
+      hfHighArusStartTime = 0;
+    }
+  } else {
+    if (relay2Auto && pln2Aktif && (now - lastRelay2Switch >= RELAY_COOLDOWN_MS)) {
+      digitalWrite(RELAY2_PIN, HIGH); 
+      pln2Aktif = false; 
+      lastRelay2Switch = now; 
+      Serial.println("[HF] OFF (LF OFF)");
+    }
+    hfHighArusStable = false; 
+    hfHighArusStartTime = 0;
+  }
+}
+
+// ============================================================
+// LCD DISPLAY
+// ============================================================
+void updateLcdDisplay() {
+  if (currentLcdPage != lastLcdPage) {
+    if (TAKE_I2C((TickType_t)100)) { 
+      lcd.clear(); 
+      GIVE_I2C(); 
+    }
+    lastLcdPage = currentLcdPage;
+  }
+
+  float tegangan = batteryConnected ? teganganFiltered : 0.0f;
+  float arusIn = batteryConnected ? fabs(arusInputFiltered) : 0.0f;
+  float arusLoad = batteryConnected ? fabs(arusLoadFiltered) : 0.0f;
+  bool wifiOK = (WiFi.status() == WL_CONNECTED);
+
+  if (TAKE_I2C((TickType_t)100)) {
+    switch (currentLcdPage) {
+      case 0: {
+        lcd.setCursor(1, 0); 
+        lcd.print("PLTS RAMLI343");
+        int len = strlen(dateTimeStr);
+        if (len > 0) {
+          char display[17];
+          for (int i = 0; i < 16; i++) 
+            display[i] = dateTimeStr[(scrollOffset + i) % len];
+          display[16] = '\0';
+          lcd.setCursor(0, 1); 
+          lcd.print(display);
+        }
+        break;
+      }
+      case 1: {
+        char battStr[10]; 
+        dtostrf(tegangan, 4, 1, battStr);
+        lcd.setCursor(0, 0); 
+        lcd.print("BATT: "); 
+        lcd.print(battStr); 
+        lcd.print("V  ");
+        lcd.setCursor(0, 1); 
+        lcd.print("IN: "); 
+        lcd.print((int)round(arusIn)); 
+        lcd.print("A ");
+        lcd.setCursor(9, 1); 
+        lcd.print("OUT: "); 
+        lcd.print((int)round(arusLoad)); 
+        lcd.print("A ");
+        break;
+      }
+      case 2: {
+        char line1[17]; 
+        snprintf(line1, sizeof(line1), "LF:%s %-7s", pln1Aktif ? "PLN" : "PLTS", relay1Auto ? "AUTO" : "MANUAL");
+        char line2[17]; 
+        snprintf(line2, sizeof(line2), "HF:%s %-7s", pln2Aktif ? "PLN" : "PLTS", relay2Auto ? "AUTO" : "MANUAL");
+        lcd.setCursor(0, 0); 
+        lcd.print(line1);
+        lcd.setCursor(0, 1); 
+        lcd.print(line2);
+        break;
+      }
+      case 3: {
+        char line1[17]; 
+        snprintf(line1, sizeof(line1), "WIFI:%-9s", wifiOK ? "ONLINE" : "OFFLINE");
+        char line2[17]; 
+        snprintf(line2, sizeof(line2), "SERVER:%-8s", serverOnline ? "ONLINE" : "OFFLINE");
+        lcd.setCursor(0, 0); 
+        lcd.print(line1);
+        lcd.setCursor(0, 1); 
+        lcd.print(line2);
+        break;
+      }
+    }
+    GIVE_I2C();
+  }
+}
+
+// ============================================================
+// SENSOR READINGS
+// ============================================================
+float bacaTeganganPV() {
+  if (!adsOK) return 0.0f;
+  float sum = 0.0f;
+  if (!TAKE_I2C((TickType_t)50)) return teganganPV;
+  
+  ads.setGain(GAIN_TWOTHIRDS);
+  for (int i = 0; i < 5; i++) {
+    int16_t adcRaw = ads.readADC_SingleEnded(ADS_CH_PV_VOLT);
+    sum += adcRaw * 0.1875f / 1000.0f * PV_DIVIDER_RATIO * calibrationFactorPV;
+    delayMicroseconds(800);
+  }
+  GIVE_I2C();
+  
+  float raw = sum / 5.0f;
+  if (raw < 0.0f || raw < 15.0f) return 0.0f;
+  if (raw > 160.0f) return teganganPV;
+  return raw;
+}
+
+// ============================================================
+// BACA TEGANGAN BATTERY - STABLE VERSION
+// ============================================================
+float bacaTeganganBaterai() {
+
+  if (!adsOK) {
+    batteryConnected = false;
+    return 0.0f;
+  }
+
+  if (!TAKE_I2C((TickType_t)50)) {
+    return teganganFiltered;
+  }
+
+  // ----------------------------------------------------------
+  // ADS1115
+  // GAIN_TWOTHIRDS = 0.1875 mV / bit
+  // ----------------------------------------------------------
+  ads.setGain(GAIN_TWOTHIRDS);
+
+  int16_t rawSamples[BATT_READ_SAMPLES];
+
+  long rawSum = 0;
+  int validCount = 0;
+
+  // ----------------------------------------------------------
+  // Ambil beberapa RAW ADC
+  // ----------------------------------------------------------
+  for (int i = 0; i < BATT_READ_SAMPLES; i++) {
+
+    int16_t raw = ads.readADC_SingleEnded(ADS_CH_BATT_VOLT);
+
+    rawSamples[i] = raw;
+
+    if (raw > 0) {
+      rawSum += raw;
+      validCount++;
+    }
+
+    delayMicroseconds(800);
+  }
+
+  GIVE_I2C();
+
+  if (validCount == 0) {
+    Serial.println("[BATT] Tidak ada RAW ADC valid");
+    return teganganFiltered;
+  }
+
+  // ----------------------------------------------------------
+  // RAW ADC average
+  // ----------------------------------------------------------
+  float rawADC =
+      (float)rawSum / (float)validCount;
+
+  // ----------------------------------------------------------
+  // Konversi RAW -> tegangan ADC
+  //
+  // 0.1875mV/bit = 0.0001875V/bit
+  // ----------------------------------------------------------
+  float adcVoltage =
+      rawADC * 0.0001875f;
+
+  // ----------------------------------------------------------
+  // ADC -> BATTERY
+  //
+  // Divider aktual hasil pengukuran:
+  //
+  // 0.820V -> 49.2V
+  // rasio = 60
+  //
+  // calibrationFactorBatt sengaja tetap 1.0
+  // ----------------------------------------------------------
+  float batteryRawVoltage =
+      adcVoltage * BATT_DIVIDER_RATIO;
+
+  float batteryVoltage =
+      batteryRawVoltage * calibrationFactorBatt;
+
+  // ----------------------------------------------------------
+  // VALIDASI
+  // ----------------------------------------------------------
+  if (!isfinite(batteryVoltage)) {
+    Serial.println("[BATT] NaN/INF");
+    return teganganFiltered;
+  }
+
+  if (batteryVoltage < BATT_MIN_VALID_VOLT ||
+      batteryVoltage > BATT_MAX_VALID_VOLT) {
+
+    Serial.printf(
+      "[BATT] OUT OF RANGE: %.3f V\n",
+      batteryVoltage
+    );
+
+    return teganganFiltered;
+  }
+
+  // ==========================================================
+  // MEDIAN FILTER
+  // ==========================================================
+
+  static float medianSamples[BATT_MEDIAN_SAMPLES] = {0};
+
+  static int medianIndex = 0;
+
+  static bool medianInitialized = false;
+
+  if (!medianInitialized) {
+
+    for (int i = 0; i < BATT_MEDIAN_SAMPLES; i++) {
+      medianSamples[i] = batteryVoltage;
+    }
+
+    medianInitialized = true;
+    medianIndex = 0;
+
+  } else {
+
+    medianSamples[medianIndex] =
+        batteryVoltage;
+
+    medianIndex++;
+
+    if (medianIndex >= BATT_MEDIAN_SAMPLES) {
+      medianIndex = 0;
+    }
+  }
+
+  float medianVoltage =
+      hitungMedian(
+        medianSamples,
+        BATT_MEDIAN_SAMPLES
+      );
+
+  // ==========================================================
+  // SPIKE PROTECTION
+  // ==========================================================
+
+  if (!teganganFilterInitialized) {
+
+    teganganFiltered = medianVoltage;
+
+  } else {
+
+    float difference =
+        medianVoltage - teganganFiltered;
+
+    // Jika lonjakan sangat besar hanya satu pembacaan,
+    // jangan langsung masukkan seluruh lonjakan ke filter.
+    if (fabs(difference) > BATT_MAX_STEP_V) {
+
+      Serial.printf(
+        "[BATT] SPIKE DITAHAN: %.3f -> %.3f V\n",
+        teganganFiltered,
+        medianVoltage
+      );
+
+      if (difference > 0) {
+        medianVoltage =
+            teganganFiltered + BATT_MAX_STEP_V;
+      } else {
+        medianVoltage =
+            teganganFiltered - BATT_MAX_STEP_V;
+      }
+    }
+  }
+
+  // ==========================================================
+  // EMA FILTER
+  // ==========================================================
+
+  if (!teganganFilterInitialized) {
+
+    teganganFiltered =
+        medianVoltage;
+
+    teganganFilterInitialized = true;
+
+  } else {
+
+    teganganFiltered =
+        (BATT_EMA_ALPHA * medianVoltage) +
+        ((1.0f - BATT_EMA_ALPHA) *
+         teganganFiltered);
+  }
+
+  // ----------------------------------------------------------
+  // Safety
+  // ----------------------------------------------------------
+  if (!isfinite(teganganFiltered)) {
+    teganganFiltered = 0.0f;
+    teganganFilterInitialized = false;
+    batteryConnected = false;
+    return 0.0f;
+  }
+
+  teganganFiltered =
+      constrain(
+        teganganFiltered,
+        0.0f,
+        BATT_MAX_VALID_VOLT
+      );
+
+  // ----------------------------------------------------------
+  // Battery connected
+  // ----------------------------------------------------------
+  batteryConnected =
+      (teganganFiltered >= 20.0f);
+
+  // ==========================================================
+  // DEBUG
+  // ==========================================================
+
+  static unsigned long lastBattDebug = 0;
+
+  unsigned long now = millis();
+
+  if (now - lastBattDebug >= BATT_DEBUG_INTERVAL_MS) {
+
+    lastBattDebug = now;
+
+    Serial.println(
+      "[BATT] --------------------------------"
+    );
+
+    Serial.printf(
+      "[BATT] RAW ADC       : %.1f\n",
+      rawADC
+    );
+
+    Serial.printf(
+      "[BATT] ADC VOLT      : %.6f V\n",
+      adcVoltage
+    );
+
+    Serial.printf(
+      "[BATT] DIVIDER       : %.2f\n",
+      BATT_DIVIDER_RATIO
+    );
+
+    Serial.printf(
+      "[BATT] BEFORE CAL    : %.3f V\n",
+      batteryRawVoltage
+    );
+
+    Serial.printf(
+      "[BATT] CAL FACTOR    : %.6f\n",
+      calibrationFactorBatt
+    );
+
+    Serial.printf(
+      "[BATT] FINAL RAW     : %.3f V\n",
+      batteryVoltage
+    );
+
+    Serial.printf(
+      "[BATT] MEDIAN        : %.3f V\n",
+      medianVoltage
+    );
+
+    Serial.printf(
+      "[BATT] FILTERED      : %.3f V\n",
+      teganganFiltered
+    );
+
+    Serial.printf(
+      "[BATT] CONNECTED     : %s\n",
+      batteryConnected ? "YES" : "NO"
+    );
+
+    Serial.println(
+      "[BATT] --------------------------------"
+    );
+  }
+
+  return teganganFiltered;
+}
+
+float bacaShuntChannel(ShuntChannel channel) {
+  if (!adsOK || !batteryConnected) 
+    return (channel == SHUNT_INPUT) ? arusInputFiltered : arusLoadFiltered;
+    
+  if (!TAKE_I2C((TickType_t)50)) 
+    return (channel == SHUNT_INPUT) ? arusInputFiltered : arusLoadFiltered;
+
+  ads.setGain(GAIN_SIXTEEN);
+  int adsChannel = (channel == SHUNT_INPUT) ? ADS_CH_SHUNT_INPUT : ADS_CH_SHUNT_LOAD;
+  float sumShunt = 0.0f;
+  float sumCurrent = 0.0f;
+
+  for (int i = 0; i < 5; i++) {
+    int16_t adcRaw = ads.readADC_SingleEnded(adsChannel);
+    float shunt_mV = adcRaw * 0.0078125f;
+    sumShunt += shunt_mV;
+    sumCurrent += (shunt_mV / SHUNT_MV_PER_A) * calibrationFactorArus;
+    delayMicroseconds(800);
+  }
+  GIVE_I2C();
+
+  float shuntRaw = sumShunt / 5.0f;
+  float offset = (channel == SHUNT_INPUT) ? arusInputOffset : arusLoadOffset;
+  float rawCurrent = (sumCurrent / 5.0f) - offset;
+  rawCurrent = fabs(rawCurrent);
+  rawCurrent = constrain(rawCurrent, 0.0f, 100.0f);
+  if (rawCurrent < ARUS_IDLE_THRESHOLD) rawCurrent = 0.0f;
+
+  if (channel == SHUNT_INPUT) {
+    if (!shuntInputFilterInitialized) {
+      for (int i = 0; i < FILTER_SAMPLES; i++) shuntInputSamples[i] = shuntRaw;
+      shuntInput_mVFiltered = shuntRaw; 
+      shuntInputFilterInitialized = true; 
+      shuntInputIndex = 0;
+    } else {
+      shuntInputSamples[shuntInputIndex] = shuntRaw;
+      shuntInputIndex = (shuntInputIndex + 1) % FILTER_SAMPLES;
+      shuntInput_mVFiltered = EMA_ALPHA_SHUNT * hitungMedian(shuntInputSamples, FILTER_SAMPLES) + 
+                              (1.0f - EMA_ALPHA_SHUNT) * shuntInput_mVFiltered;
+    }
+    if (!arusInputFilterInitialized) {
+      for (int i = 0; i < FILTER_SAMPLES; i++) arusInputSamples[i] = rawCurrent;
+      arusInputFiltered = rawCurrent; 
+      arusInputFilterInitialized = true; 
+      arusInputIndex = 0;
+    } else {
+      arusInputSamples[arusInputIndex] = rawCurrent;
+      arusInputIndex = (arusInputIndex + 1) % FILTER_SAMPLES;
+      arusInputFiltered = EMA_ALPHA_ARUS * hitungMedian(arusInputSamples, FILTER_SAMPLES) + 
+                          (1.0f - EMA_ALPHA_ARUS) * arusInputFiltered;
+    }
+    if (fabs(arusInputFiltered) < ARUS_IDLE_THRESHOLD) arusInputFiltered = 0.0f;
+    return arusInputFiltered;
+  }
+
+  if (!shuntLoadFilterInitialized) {
+    for (int i = 0; i < FILTER_SAMPLES; i++) shuntLoadSamples[i] = shuntRaw;
+    shuntLoad_mVFiltered = shuntRaw; 
+    shuntLoadFilterInitialized = true; 
+    shuntLoadIndex = 0;
+  } else {
+    shuntLoadSamples[shuntLoadIndex] = shuntRaw;
+    shuntLoadIndex = (shuntLoadIndex + 1) % FILTER_SAMPLES;
+    shuntLoad_mVFiltered = EMA_ALPHA_SHUNT * hitungMedian(shuntLoadSamples, FILTER_SAMPLES) + 
+                           (1.0f - EMA_ALPHA_SHUNT) * shuntLoad_mVFiltered;
+  }
+  if (!arusLoadFilterInitialized) {
+    for (int i = 0; i < FILTER_SAMPLES; i++) arusLoadSamples[i] = rawCurrent;
+    arusLoadFiltered = rawCurrent; 
+    arusLoadFilterInitialized = true; 
+    arusLoadIndex = 0;
+  } else {
+    arusLoadSamples[arusLoadIndex] = rawCurrent;
+    arusLoadIndex = (arusLoadIndex + 1) % FILTER_SAMPLES;
+    arusLoadFiltered = EMA_ALPHA_ARUS * hitungMedian(arusLoadSamples, FILTER_SAMPLES) + 
+                       (1.0f - EMA_ALPHA_ARUS) * arusLoadFiltered;
+  }
+  if (fabs(arusLoadFiltered) < ARUS_IDLE_THRESHOLD) arusLoadFiltered = 0.0f;
+  return arusLoadFiltered;
+}
+
+// ============================================================
+// POLL CONFIG FROM SUPABASE
+// ============================================================
+void pollRelayConfigFromServer() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!TAKE_HTTP(0)) return;
+  if (httpBusy) { 
+    GIVE_HTTP(); 
+    return; 
+  }
+  
+  httpBusy = true;
+  String url = String(SUPABASE_URL) + "/rest/v1/" + CONFIG_TABLE +
+               "?id=eq.1&select=relay1_mode,relay2_mode," +
+               "hf_on_amp,hf_off_amp,hf_stable_time," +
+               "calib_factor_batt,calib_factor_pv,arus_offset,arus_gain," +
+               "volt_cutoff_lf,volt_restore_lf,pv_interlock_volt";
+
+  globalSecureClient.setInsecure();
+  globalSecureClient.setTimeout(8);
+  HTTPClient http;
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.setReuse(false);
+
+  if (http.begin(globalSecureClient, url)) {
+    http.addHeader("apikey", SUPABASE_KEY);
+    http.addHeader("Authorization", "Bearer " + String(SUPABASE_KEY));
+    int httpCode = http.GET();
+
+    if (httpCode == 200) {
+      serverOnline = true;
+      String payload = http.getString();
+      if (payload.length() > 2) {
+        StaticJsonDocument<768> doc;
+        DeserializationError err = deserializeJson(doc, payload);
+        if (!err && doc.is<JsonArray>() && doc.size() > 0) {
+          JsonObject row = doc[0];
+
+          const char* r1mode = row["relay1_mode"] | "AUTO";
+          const char* r2mode = row["relay2_mode"] | "AUTO";
+          bool newR1Auto = (strcmp(r1mode, "AUTO") == 0);
+          bool newR1State = (strcmp(r1mode, "ON") == 0);
+          bool newR2Auto = (strcmp(r2mode, "AUTO") == 0);
+          bool newR2State = (strcmp(r2mode, "ON") == 0);
+
+          float hfOn = row["hf_on_amp"] | HF_ON_AMP;
+          float hfOff = row["hf_off_amp"] | HF_OFF_AMP;
+          unsigned long hfStable = (unsigned long)(row["hf_stable_time"] | (int)HF_STABLE_TIME_MS);
+          if (hfOn > 0) HF_ON_AMP = hfOn;
+          if (hfOff > 0) HF_OFF_AMP = hfOff;
+          if (hfStable > 0) HF_STABLE_TIME_MS = hfStable;
+
+          float lfOn = row["volt_cutoff_lf"] | LF_BATT_ON_V;
+          float lfOff = row["volt_restore_lf"] | LF_BATT_OFF_V;
+          float pvOv = row["pv_interlock_volt"] | PV_OVERRIDE_V;
+          if (lfOn > 0) LF_BATT_ON_V = lfOn;
+          if (lfOff > 0) LF_BATT_OFF_V = lfOff;
+          if (pvOv > 0) PV_OVERRIDE_V = pvOv;
+
+          float configCalibBatt = row["calib_factor_batt"] | calibrationFactorBatt;
+          float configCalibPV = row["calib_factor_pv"] | calibrationFactorPV;
+          float configArusOffset = row["arus_offset"] | arusOffset;
+          float configArusGain = row["arus_gain"] | calibrationFactorArus;
+          if (configCalibBatt > 0.5f && configCalibBatt < 1.5f) calibrationFactorBatt = configCalibBatt;
+          if (configCalibPV > 0.5f && configCalibPV < 1.5f) calibrationFactorPV = configCalibPV;
+          if (configArusOffset >= -20.0f && configArusOffset <= 20.0f) arusOffset = configArusOffset;
+          if (configArusGain > 0.5f && configArusGain < 1.5f) calibrationFactorArus = configArusGain;
+
+          unsigned long now = millis();
+          if (relay1Auto != newR1Auto || (!relay1Auto && pln1Aktif != newR1State)) {
+            if (now - lastRelay1Switch >= RELAY_COOLDOWN_MS) {
+              relay1Auto = newR1Auto;
+              if (!relay1Auto && teganganPV < PV_OVERRIDE_V) {
+                pln1Aktif = newR1State;
+                digitalWrite(RELAY1_PIN, pln1Aktif ? LOW : HIGH);
+                lastRelay1Switch = now;
+                Serial.printf("[SERVER] Relay1 -> %s\n", r1mode);
+              }
+            }
+          }
+          if (relay2Auto != newR2Auto || (!relay2Auto && pln2Aktif != newR2State)) {
+            if (now - lastRelay2Switch >= RELAY_COOLDOWN_MS) {
+              relay2Auto = newR2Auto;
+              if (!relay2Auto && teganganPV < PV_OVERRIDE_V) {
+                pln2Aktif = newR2State;
+                digitalWrite(RELAY2_PIN, pln2Aktif ? LOW : HIGH);
+                lastRelay2Switch = now;
+                Serial.printf("[SERVER] Relay2 -> %s\n", r2mode);
+              }
+            }
+          }
+        }
+      }
+    } else {
+      serverOnline = false;
+      Serial.printf("[SERVER] Poll config HTTP %d\n", httpCode);
+    }
+    http.end();
+  } else {
+    serverOnline = false;
+  }
+
+  httpBusy = false;
+  GIVE_HTTP();
+}
+
+// ============================================================
+// SEND DATA TO SUPABASE
+// ============================================================
+void supabaseTaskFn(void *pvParameters) {
+  esp_task_wdt_add(NULL);
+  for (;;) {
+    esp_task_wdt_reset();
+    if (WiFi.status() == WL_CONNECTED) sendDataToSupabase();
+    vTaskDelay(pdMS_TO_TICKS(INTERVAL_KIRIM_MS));
+  }
+}
+
+void sendDataToSupabase() {
+  if (WiFi.status() != WL_CONNECTED || ESP.getFreeHeap() < 15000) return;
+  if (!TAKE_HTTP(pdMS_TO_TICKS(100))) return;
+  if (httpBusy) { 
+    GIVE_HTTP(); 
+    return; 
+  }
+
+  httpBusy = true;
+  esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+  bool success = false;
+
+  for (int attempt = 1; attempt <= HTTP_MAX_RETRY; attempt++) {
+    if (attempt > 1) {
+      int delayMs = 1000 * (1 << (attempt - 1));
+      vTaskDelay(pdMS_TO_TICKS(delayMs));
+    }
+    esp_task_wdt_reset();
+
+    StaticJsonDocument<320> doc;
+    doc["firmware"] = CURRENT_FIRMWARE_VERSION;
+    doc["tegangan"] = batteryConnected ? teganganFiltered : 0.0f;
+    doc["arus_input"] = batteryConnected ? arusInputFiltered : 0.0f;
+    doc["arus_load"] = batteryConnected ? arusLoadFiltered : 0.0f;
+    doc["arus"] = batteryConnected ? arusLoadFiltered : 0.0f;
+    doc["daya"] = batteryConnected ? (teganganFiltered * arusLoadFiltered) : 0.0f;
+    doc["pv_voltage"] = teganganPV;
+    doc["pln_aktif"] = pln1Aktif;
+    doc["pln2_aktif"] = pln2Aktif;
+    doc["sensor_ok"] = adsOK;
+    doc["battery_connected"] = batteryConnected;
+
+    String jsonData;
+    serializeJson(doc, jsonData);
+
+    String url = String(SUPABASE_URL) + "/rest/v1/" + SUPABASE_TABLE;
+    globalSecureClient.setInsecure();
+    globalSecureClient.setTimeout(8);
+    HTTPClient http;
+    http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.setReuse(false);
+
+    if (http.begin(globalSecureClient, url)) {
+      http.addHeader("Content-Type", "application/json");
+      http.addHeader("Host", SUPABASE_HOST);
+      http.addHeader("apikey", SUPABASE_KEY);
+      http.addHeader("Authorization", "Bearer " + String(SUPABASE_KEY));
+      http.addHeader("Prefer", "return=minimal");
+
+      int httpCode = http.POST(jsonData);
+      http.end();
+
+      if (httpCode >= 200 && httpCode < 300) {
+        success = true;
+        serverOnline = true;
+        Serial.printf("[HTTP] OK %d\n", httpCode);
+        break;
+      } else {
+        Serial.printf("[HTTP] FAIL %d attempt %d\n", httpCode, attempt);
+        if (attempt == HTTP_MAX_RETRY) serverOnline = false;
+      }
+    }
+    esp_task_wdt_reset();
+  }
+
+  esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+  httpBusy = false;
+  GIVE_HTTP();
+}
